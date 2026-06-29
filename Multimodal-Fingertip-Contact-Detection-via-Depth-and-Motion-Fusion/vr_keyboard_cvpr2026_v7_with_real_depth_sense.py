@@ -1,0 +1,2117 @@
+"""
+VR Keyboard with AI Depth Estimation - CVPR 2026 Implementation (Version 1)
+============================================================================
+Real-Time Multimodal Fingertip Contact Detection via Depth and Motion Fusion
+for Vision-Based Human-Computer Interaction
+
+This implementation matches the methodology described in the CVPR 2026 paper:
+- Velocity-based tap detection (PRIMARY) with state machine
+- Threshold hysteresis mechanism (4.5mm entry, 6.0mm exit)
+- Multi-modal contact detection fusion (depth + motion)
+- Cooldown mechanism (450ms / ~15 frames @ 30fps)
+- Fine-tuned Depth Anything V2 model
+
+Paper Claims:
+- Contact Detection Accuracy: 94.2% (DepthAnythingV2-ft)
+- MAE: 3.2mm (after fine-tuning, from 12.8mm pre-trained)
+- WPM: 45.6 (best configuration)
+- CER: 3.1%
+- F1-Score: 94.4%
+- False Positive Rate: 4.2%
+
+Author: Mukhiddin Toshpulatov
+Institution: KAIST SpaceTop Research Center
+"""
+
+#This is vr keyboard project for CVPR 2026 paper. This is the main implementation file, version 1 (v7). It includes the velocity-based tap detection with state machine, threshold hysteresis, multi-modal fusion, and real-time performance metrics. The depth model is fine-tuned Depth Anything V2. The code is structured for clarity and modularity, with detailed comments explaining each part of the methodology.
+
+
+import sys
+import os
+import numpy as np
+from pathlib import Path
+from riesz_visualizer import RieszVisualizer
+import pyrealsense2 as rs
+
+
+
+
+
+DEPTH_MODEL_PATH = r"D:\DL\Research\Depth-Anything-V2\metric_depth"
+#DEPTH_MODEL_PATH = r"D:\Codes\vscode\Depth_Anything_V2_main\metric_depth"
+if os.path.exists(DEPTH_MODEL_PATH):
+    sys.path.insert(0, DEPTH_MODEL_PATH)
+# Add src path for local modules
+import cv2
+import numpy as np
+import json
+import time
+import mediapipe as mp
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Optional, Dict, List, Tuple, Any
+from enum import Enum
+import torch
+import torch.nn.functional as F
+torch.serialization.add_safe_globals([np.core.multiarray._reconstruct])
+
+# Try to import depth model
+# try:
+#     # Try local version first (with our custom code)
+#     from depth_model_manager import DepthEstimator
+#     DEPTH_MODEL_AVAILABLE = True
+#     print("[INFO] Using LOCAL depth_model_manager.py")
+# except ImportError:
+#     try:
+#         # Fallback to installed version
+#         from src.depth_model_manager import DepthEstimator
+#         DEPTH_MODEL_AVAILABLE = True
+#         print("[INFO] Using INSTALLED depth_model_manager from src/")
+try:
+    # Try src version first (the GOOD one with vitl fix)
+    from src.depth_model_manager import DepthEstimator
+    DEPTH_MODEL_AVAILABLE = True
+    print("[INFO] Using DEPTH_MODEL_MANAGER from src/")
+except ImportError:
+    try:
+        # Fallback to local version
+        from depth_model_manager import DepthEstimator
+        DEPTH_MODEL_AVAILABLE = True
+        print("[INFO] Using LOCAL depth_model_manager.py")
+    except ImportError:
+        print("WARNING: DepthEstimator not available. Using mock depth.")
+        DEPTH_MODEL_AVAILABLE = False
+
+# Try to import pynput for real keyboard simulation
+try:
+    from pynput.keyboard import Controller, Key
+    PYNPUT_AVAILABLE = True
+except ImportError:
+    print("WARNING: pynput not installed. Install with: pip install pynput")
+    PYNPUT_AVAILABLE = False
+    Controller = None
+    Key = None
+
+
+
+@dataclass
+class TipFeatures:
+    velocity_y: float
+    acceleration_y: float
+    depth_cm: float
+    stability: float
+    brightness_change: float
+    hysteresis: float
+
+
+class TipPowerEstimator:
+    """
+    Estimates 'Tip Power': a fused measure of fingertip contact force.
+ 
+    Two physical signals are combined:
+      1. Contact AREA  — how many pixels of fingertip skin are touching
+                         (larger flattened patch = more pressure)
+      2. Contact BRIGHTNESS — how bright the contact region is
+                         (more pressure → more skin/light = brighter)
+ 
+    A third physics-inspired signal is added from existing data:
+      3. Impact VELOCITY — faster approach = harder tap
+ 
+    The three are fused into a single [0.0 – 1.0] power score.
+    The score feeds back into confidence, making hard taps more reliable.
+    """
+ 
+    def __init__(
+        self,
+        area_radius: int = 14,         # px radius to sample around fingertip
+        brightness_baseline_frames: int = 10,  # frames used to compute idle baseline
+        velocity_scale: float = 80.0,  # px/s that maps to power=1.0
+    ):
+        self.area_radius = area_radius
+        self.brightness_baseline_frames = brightness_baseline_frames
+        self.velocity_scale = velocity_scale
+ 
+        # Per-finger state
+        self.idle_brightness: Dict[str, float] = {}        # rolling baseline
+        self.idle_brightness_buf: Dict[str, list] = {}
+        self.power_history: Dict[str, list] = {}            # smoothing buffer
+        self.velocity_samples : List[float] = []
+        self.last_power: Dict[str, float] = {}
+  
+        self.peak_hold: Dict[str, float] = {}
+        self.peak_hold_counter: Dict[str, int] = {}
+        self.velocity_samples: List[float] = []
+        self.velocity_scale_adaptive: float = 80.0
+ 
+    # ----------------------------------------------------------
+    def _contact_area(self, frame: np.ndarray, cx: int, cy: int) -> float:
+        """
+        Estimate the fraction of pixels in a disk that look like skin
+        in contact (bright, saturated region).
+ 
+        Returns area score in [0, 1].
+        """
+        h, w = frame.shape[:2]
+        r = self.area_radius
+        x1, y1 = max(0, cx - r), max(0, cy - r)
+        x2, y2 = min(w, cx + r), min(h, cy + r)
+        roi = frame[y1:y2, x1:x2]
+ 
+        if roi.size == 0:
+            return 0.0
+ 
+        # Convert to LAB for skin-tone detection
+        lab = cv2.cvtColor(roi, cv2.COLOR_BGR2Lab)
+        L, a, b = cv2.split(lab)
+ 
+        # Skin appears as moderate-to-high L, positive a (reddish), moderate b
+        skin_mask = (
+            (L > 120) &          # Not too dark
+            (a > 125) &          # Reddish (a* channel)
+            (a < 175) &
+            (b > 120)            # Slightly yellowish
+        )
+ 
+        total_pixels = roi.shape[0] * roi.shape[1]
+        if total_pixels == 0:
+            return 0.0
+ 
+        area_fraction = float(np.sum(skin_mask)) / total_pixels
+        return min(area_fraction * 3.0, 1.0)   # scale up since skin fraction is small
+ 
+    # ----------------------------------------------------------
+    def _contact_brightness(self, frame: np.ndarray, finger_id: str,
+                             cx: int, cy: int) -> float:
+        """
+        Measure brightness change compared to idle baseline.
+        More pressure → brighter patch.
+ 
+        Returns brightness score in [0, 1].
+        """
+        h, w = frame.shape[:2]
+        r = self.area_radius
+        x1, y1 = max(0, cx - r), max(0, cy - r)
+        x2, y2 = min(w, cx + r), min(h, cy + r)
+        roi = frame[y1:y2, x1:x2]
+ 
+        if roi.size == 0:
+            return 0.0
+ 
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape) == 3 else roi
+        current_brightness = float(np.mean(gray))
+ 
+        # Update idle baseline (exponential moving average)
+        if finger_id not in self.idle_brightness_buf:
+            self.idle_brightness_buf[finger_id] = []
+            self.idle_brightness[finger_id] = current_brightness
+ 
+        buf = self.idle_brightness_buf[finger_id]
+        if len(buf) < self.brightness_baseline_frames:
+            buf.append(current_brightness)
+            self.idle_brightness[finger_id] = float(np.mean(buf))
+            return 0.0
+ 
+        baseline = self.idle_brightness[finger_id]
+        # Slow-update baseline so it adapts to lighting changes
+        self.idle_brightness[finger_id] = 0.98 * baseline + 0.02 * current_brightness
+ 
+        delta = current_brightness - baseline
+        # Clamp: we expect a +5 to +40 brightness jump on contact
+        score = np.clip(delta / 35.0, 0.0, 1.0)
+        return float(score)
+ 
+    # ----------------------------------------------------------
+    def estimate(
+        self,
+        frame: np.ndarray,
+        finger_id: str,
+        cx: int,
+        cy: int,
+        impact_velocity: float,    # |vy| at the moment of contact (px/s)
+        is_contact: bool
+    ) -> Tuple[float, Dict]:
+        """
+        Fuse area + brightness + velocity into a single Tip Power score.
+ 
+        Args:
+            frame           : BGR frame
+            finger_id       : e.g. 'h0_f8'
+            cx, cy          : fingertip pixel coordinates
+            impact_velocity : |vy| from velocity history (px/s)
+            is_contact      : whether contact is currently detected
+ 
+        Returns:
+            (power_score [0-1], debug_dict)
+        """
+        area_score       = self._contact_area(frame, cx, cy)
+        brightness_score = self._contact_brightness(frame, finger_id, cx, cy)
+
+        if abs(impact_velocity) > 5:
+            self.velocity_samples.append(abs(impact_velocity))
+            if len(self.velocity_samples) > 50:
+                self.velocity_samples.pop(0)
+            if len(self.velocity_samples) >= 10:
+                self.velocity_scale_adaptive = float(np.percentile(self.velocity_samples, 90))
+        velocity_score   = float(np.clip(abs(impact_velocity) / self.velocity_scale_adaptive, 0.0, 1.0))
+ 
+        # Weighted fusion
+        # Velocity is most reliable (physics); area & brightness are noisier
+        raw_power = (
+            0.45 * velocity_score +
+            0.30 * brightness_score +
+            0.25 * area_score
+        )
+ 
+        # Temporal smoothing (3-frame buffer)
+        if finger_id not in self.power_history:
+            self.power_history[finger_id] = []
+        buf = self.power_history[finger_id]
+        buf.append(raw_power)
+        if len(buf) > 3:
+            buf.pop(0)
+        smoothed_power = float(np.mean(buf))
+ 
+        # Decay when not in contact
+        if not is_contact:
+            smoothed_power *= 0.7
+        PEAK_HOLD_FRAMES = 8
+        if smoothed_power > self.peak_hold.get(finger_id, 0.0):
+            self.peak_hold[finger_id] = smoothed_power
+            self.peak_hold_counter[finger_id] = PEAK_HOLD_FRAMES
+        else:
+            count = self.peak_hold_counter.get(finger_id, 0)
+            if count > 0:
+                self.peak_hold_counter[finger_id] = count - 1
+                smoothed_power = max(smoothed_power, self.peak_hold[finger_id] * 0.85)
+            else:
+                self.peak_hold[finger_id] = smoothed_power
+ 
+        self.last_power[finger_id] = smoothed_power
+ 
+        debug = {
+            'tip_power':        round(smoothed_power, 3),
+            'power_area':       round(area_score, 3),
+            'power_brightness': round(brightness_score, 3),
+            'power_velocity':   round(velocity_score, 3),
+        }
+        return smoothed_power, debug
+ 
+    # ----------------------------------------------------------
+    def power_to_label(self, power: float) -> str:
+        """Classify power score into human-readable label."""
+        if power < 0.2:
+            return 'light'
+        elif power < 0.55:
+            return 'medium'
+        else:
+            return 'hard'
+        
+    def compute(self, f: TipFeatures) -> float:
+        # 1. Motion Score (How fast is the finger moving?)
+        # We use tanh to squash the value between 0 and 1
+        motion_score = np.tanh(f.velocity_y / 30.0) 
+        
+        # 2. Impact Score (Did it stop suddenly?)
+        # Deceleration is the key to a "crisp" tap
+        impact_score = np.tanh(abs(min(f.acceleration_y, 0)) / 40.0)
+        
+        # 3. Depth Score (Is it at the surface?)
+        # Gaussian curve: 1.0 at 0cm, drops quickly as you move away
+        depth_score = np.exp(-(f.depth_cm**2) / 0.8)
+        
+        # 4. THE CORRELATION (The "Agreement" Logic)
+        # We multiply by depth_score so that motion in the air is ignored
+        core_confidence = (motion_score * 0.3 + impact_score * 0.7) * depth_score
+        
+        # 5. Visual Bonuses
+        # Add small nudges for shadow and stability
+        final_score = core_confidence + (f.brightness_change * 0.1) + (f.stability * 0.05)
+        
+        # 6. Hysteresis (Keep it pressed if it was already triggered)
+        if f.hysteresis > 0:
+            final_score = max(final_score, 0.4)
+            
+        return min(max(final_score, 0.0), 1.0)
+
+
+
+
+class TapState(Enum):
+    """Tap detection state machine states."""
+    IDLE = "idle"
+    APPROACHING = "approaching"
+    CONTACT = "contact"
+    RETRACTING = "retracting"
+
+
+@dataclass
+class ContactMetrics:
+    """Real-time contact detection metrics for evaluation."""
+    true_positives: int = 0
+    false_positives: int = 0
+    true_negatives: int = 0
+    false_negatives: int = 0
+    total_taps: int = 0
+    total_frames: int = 0
+
+    @property
+    def precision(self) -> float:
+        if self.true_positives + self.false_positives == 0:
+            return 0.0
+        return self.true_positives / (self.true_positives + self.false_positives)
+
+    @property
+    def recall(self) -> float:
+        if self.true_positives + self.false_negatives == 0:
+            return 0.0
+        return self.true_positives / (self.true_positives + self.false_negatives)
+
+    @property
+    def f1_score(self) -> float:
+        if self.precision + self.recall == 0:
+            return 0.0
+        return 2 * (self.precision * self.recall) / (self.precision + self.recall)
+
+    @property
+    def accuracy(self) -> float:
+        total = self.true_positives + self.true_negatives + self.false_positives + self.false_negatives
+        if total == 0:
+            return 0.0
+        return (self.true_positives + self.true_negatives) / total
+
+    @property
+    def false_positive_rate(self) -> float:
+        if self.false_positives + self.true_negatives == 0:
+            return 0.0
+        return self.false_positives / (self.false_positives + self.true_negatives)
+
+
+@dataclass
+class TypingMetrics:
+    """Typing performance metrics."""
+    total_characters: int = 0
+    correct_characters: int = 0
+    total_words: int = 0
+    start_time: float = field(default_factory=time.time)
+    errors: int = 0
+
+    @property
+    def wpm(self) -> float:
+        """Words per minute (using standard 5 chars = 1 word)."""
+        elapsed = time.time() - self.start_time
+        if elapsed == 0 or elapsed < 1.0:  # ← Avoid division by tiny numbers
+            return 0.0
+        # Standard WPM: (characters / 5) / (time in minutes)
+        words = self.total_characters / 5.0  # ← Changed
+        minutes = elapsed / 60.0
+        return words / minutes  # ← Changed
+
+    @property
+    def cer(self) -> float:
+        """Character error rate."""
+        if self.total_characters == 0:
+            return 0.0
+        return self.errors / self.total_characters
+
+
+class VelocityBasedContactDetector:
+    """
+    Advanced multi-modal contact detection with velocity-based tap detection.
+
+    This implements the paper's methodology:
+    1. Velocity-based tap detection (PRIMARY)
+    2. Threshold hysteresis (4.5mm entry, 6.0mm exit)
+    3. Depth fusion
+    4. Temporal consistency
+    5. Cooldown mechanism
+    """
+
+    def __init__(
+    self,
+    history_size: int = 5,
+    contact_entry_threshold_cm: float = 1.5,
+    contact_exit_threshold_cm: float = 2.5,
+    velocity_threshold_approach: float = 20.0,
+    velocity_threshold_stop: float = 8.0,
+    velocity_drop_ratio: float = 0.5,
+    min_peak_velocity: float = 30.0,
+    velocity_threshold_retract: float = -8.0,
+    required_contact_frames: int = 2,
+    cooldown_frames: int = 20,
+    confidence_threshold: float = 0.50  
+):
+        self.history_size = history_size
+
+        # Threshold hysteresis (paper Section 5)
+        self.contact_entry_threshold_cm = contact_entry_threshold_cm
+        self.contact_exit_threshold_cm = contact_exit_threshold_cm
+
+        # Velocity parameters
+        self.velocity_threshold_approach = velocity_threshold_approach
+        self.velocity_threshold_stop = velocity_threshold_stop
+        self.velocity_drop_ratio = velocity_drop_ratio
+        self.min_peak_velocity = min_peak_velocity
+        self.velocity_threshold_retract = velocity_threshold_retract
+
+        # Temporal parameters
+        self.required_contact_frames = required_contact_frames
+        self.cooldown_frames = cooldown_frames
+        self.confidence_threshold = confidence_threshold
+
+        # Per-finger tracking
+        self.position_history: Dict[str, deque] = {}
+        self.velocity_history: Dict[str, deque] = {}
+        self.depth_history: Dict[str, deque] = {}
+        self.brightness_history: Dict[str, deque] = {}
+        #Arena
+        self.key_thresholds: Dict[str, Tuple[float, float]] = {}
+
+        self.distance_history: Dict[str, deque] = {}
+
+        # State tracking
+        self.tap_state: Dict[str, TapState] = {}
+        self.peak_velocity: Dict[str, float] = {}
+        self.contact_frames: Dict[str, int] = {}
+        self.cooldown_counter: Dict[str, int] = {}
+        self.in_contact: Dict[str, bool] = {}  # For hysteresis
+
+        self.tap_velocity_at_trigger: Dict[str, float] = {}  
+        # ← ADD THESE NEW LINES:
+        self.tap_triggered: Dict[str, bool] = {}  # Prevent multiple triggers per tap
+        self.was_in_contact: Dict[str, bool] = {}  # Debouncing
+        
+        # Metrics
+        self.metrics = ContactMetrics()
+
+        
+        self.last_tap_time: Dict[str, float] = {}
+
+        # For Power Tip
+        self.prev_time : Dict[str,float ] = {}
+        self.prev_velocity : Dict[str, float] = {}
+
+
+    # def get_smoothed_depth(self, finger_id: str, current_depth: float) -> float:
+    #     """
+    #     Apply temporal smoothing to depth readings.
+    #     Reduces jitter from depth estimation noise.
+    #     """
+    #     if finger_id not in self.depth_history:
+    #         return current_depth
+        
+    #     history = list(self.depth_history[finger_id])
+    #     if len(history) == 0:
+    #         return current_depth
+        
+    #     # Exponential moving average (alpha=0.3 for smoothing)
+    #     smoothed = current_depth * 0.3 + np.mean(history) * 0.7
+        
+    #     return smoothed
+
+
+
+    def compute_natural_tap_quality(self, finger_id: str) -> Tuple[float, Dict[str, Any]]:
+        debug = {}
+        if finger_id not in self.distance_history or len(self.distance_history[finger_id]) < 8:
+            return 0.0, debug
+
+        distances = list(self.distance_history[finger_id])[-25:]
+        velocities = list(self.velocity_history.get(finger_id, []))[-25:]
+        positions = list(self.position_history.get(finger_id, []))
+
+        n = min(len(distances), len(velocities))
+        if n < 8:
+            return 0.0, debug
+
+        vy = [v[1] for v in velocities]
+        dist = [max(0.0, d) for d in distances]
+
+        curr_dist = dist[-1]
+        curr_vy = vy[-1]
+        vy_recent = vy[-6:] if len(vy) >= 6 else vy          # last 6 frames (primary)
+        vy_older  = vy[-12:-6] if len(vy) >= 12 else []       # 6-12 frames ago (secondary)
+
+        recent_peak_primary = max(abs(v) for v in vy_recent) if vy_recent else 0.0
+        recent_peak_older   = max(abs(v) for v in vy_older) * 0.5 if vy_older else 0.0  # discounted
+        recent_peak = max(recent_peak_primary, recent_peak_older)
+        depth_delta = max(dist[-15:]) - curr_dist if len(dist) >= 15 else 0.0
+
+        peak_is_recent = any(abs(v) >= recent_peak * 0.9 for v in vy[-7:])
+        
+        # FIX: Only penalize dwell when finger is VERY close AND truly stationary
+        # Was: abs(v) < 6.0 and d < 4.5 over 15 frames — too aggressive
+        low_vel_dwell = sum(1 for v, d in zip(vy[-6:], dist[-6:])   # was 8 frames
+                    if abs(v) < 2.0 and d < 1.5)
+        
+        lateral_stability = 1.0
+        if len(positions) >= 12:
+            recent_x = [p[0] for p in positions[-12:]]
+            lateral_std = np.std(recent_x)
+            lateral_stability = max(0.0, 1.0 - (lateral_std / 12.0))
+
+        velocity_collapse = 0.0
+        if recent_peak > 8.0:
+            velocity_collapse = min(1.0, (recent_peak - abs(curr_vy)) / recent_peak)
+
+        signature_score = (
+            velocity_collapse * 0.50 +           # increased weight
+            (1 if peak_is_recent and recent_peak > 11.0 else 0) * 0.22 +
+            min(1.0, depth_delta / 1.0) * 0.18 +
+            lateral_stability * 0.10
+        ) - (min(1.0, low_vel_dwell / 4.0) * 0.20)  # reduced penalty (was 0.45)
+
+        signature_score = max(0.0, min(1.0, signature_score))
+
+        debug.update({
+            'curr_dist': round(curr_dist, 2),
+            'curr_vy': round(curr_vy, 1),
+            'peak_vy': round(recent_peak, 1),
+            'depth_delta': round(depth_delta, 2),
+            'low_vel_dwell': low_vel_dwell,
+            'lateral_stability': round(lateral_stability, 2),
+            'signature_score': round(signature_score, 3)
+        })
+
+        return signature_score, debug
+
+    
+    
+    
+    def compute_creative_impact_score(self, finger_id: str) -> Tuple[float, Dict[str, Any]]:
+        """Creative 'Tap Signature Score' - detects real impact, rejects hovers using your per-key calibration."""
+        debug = {}
+        if finger_id not in self.distance_history or len(self.distance_history[finger_id]) < 10:
+            debug['reject'] = 'not_enough_history'
+            return 0.0, debug
+
+        distances = list(self.distance_history[finger_id])[-20:]
+        velocities = list(self.velocity_history.get(finger_id, []))[-20:]
+        positions = list(self.position_history.get(finger_id, []))
+
+        n = min(len(distances), len(velocities))
+        if n < 8:
+            debug['reject'] = 'not_enough_history'
+            return 0.0, debug
+
+        vy = [v[1] for v in velocities]
+        dist = [max(0.0, d) for d in distances]
+
+        curr_dist = dist[-1]
+        curr_vy = vy[-1]
+        recent_peak = max(abs(v) for v in vy[-12:]) if len(vy) >= 12 else 0.0
+        depth_delta = max(dist[-15:]) - curr_dist if len(dist) >= 15 else 0.0
+
+        # Dwell time (how long finger has been slow near surface)
+        low_vel_dwell = sum(1 for v, d in zip(vy[-12:], dist[-12:]) if abs(v) < 5.0 and d < 4.0)
+
+        # Lateral stability (real taps have controlled movement)
+        lateral_stability = 1.0
+        if len(positions) >= 10:
+            recent_x = [p[0] for p in positions[-10:]]
+            lateral_std = np.std(recent_x)
+            lateral_stability = max(0.0, 1.0 - (lateral_std / 15.0))
+
+        # Use per-key thresholds from your JSON if available
+        key_sensitivity = 1.0
+        if hasattr(self, 'key_thresholds') and self.key_thresholds and 's' in finger_id.lower():  # example for 's'
+            # You can extend this to use best_key from _check_key_press
+            key_sensitivity = 1.2  # example boost for 's' from your JSON
+
+        # Creative Tap Signature Score
+        velocity_collapse = 0.0
+        if recent_peak > 8.0:
+            velocity_collapse = min(1.0, (recent_peak - abs(curr_vy)) / recent_peak)
+
+        score = (
+            velocity_collapse * 0.45 + 
+            (1 if recent_peak > 11.0 else 0) * 0.20 + 
+            min(1.0, depth_delta / 1.0) * 0.15 + 
+            lateral_stability * 0.10
+        ) - (min(1.0, low_vel_dwell / 6.0) * 0.40)
+
+        score = max(0.0, min(1.0, score * key_sensitivity))
+
+        debug.update({
+            'curr_dist': round(curr_dist, 2),
+            'curr_vy': round(curr_vy, 1),
+            'peak_vy': round(recent_peak, 1),
+            'depth_delta': round(depth_delta, 2),
+            'low_vel_dwell': low_vel_dwell,
+            'lateral_stability': round(lateral_stability, 2),
+            'creative_score': round(score, 3)
+        })
+
+        return score, debug
+    def get_smoothed_depth(self, finger_id: str) -> float:
+        """Lighter smoothing so depth tracks the finger more responsively."""
+        if finger_id not in self.depth_history or len(self.depth_history[finger_id]) == 0:
+            return 0.0
+        
+        hist = list(self.depth_history[finger_id])
+        if len(hist) == 1:
+            return hist[0]
+        
+        # Use only last 8 frames (was 20) — more responsive
+        recent = hist[-8:]
+        med = float(np.median(recent))
+        cur = hist[-1]
+        
+        # Reject only large jumps (was 0.03 → 0.05)
+        if abs(cur - med) > 0.05:
+            cur = med
+        
+        # Faster tracking: alpha=0.35 (was 0.18)
+        alpha = 0.35
+        smoothed = recent[0]
+        for v in recent[1:]:
+            smoothed = alpha * v + (1 - alpha) * smoothed
+        
+        return smoothed
+
+    def _init_finger(self, finger_id: str):
+        """Initialize tracking for a new finger."""
+        if finger_id not in self.position_history:
+            self.position_history[finger_id] = deque(maxlen=self.history_size)
+            self.velocity_history[finger_id] = deque(maxlen=self.history_size)
+            self.depth_history[finger_id] = deque(maxlen=self.history_size)
+            self.brightness_history[finger_id] = deque(maxlen=self.history_size)
+            self.tap_state[finger_id] = TapState.IDLE
+            self.peak_velocity[finger_id] = 0.0
+            self.contact_frames[finger_id] = 0
+            self.distance_history[finger_id] = deque(maxlen=max(30, self.history_size))
+            self.cooldown_counter[finger_id] = 0
+            self.in_contact[finger_id] = False
+            self.tap_triggered[finger_id] = False
+            self.was_in_contact[finger_id] = False
+
+    def update_history(
+        self,
+        finger_id: str,
+        x: int,
+        y: int,
+        depth: float,
+        brightness: float,
+        timestamp: float
+    ):
+        """Update tracking history for a finger."""
+        self._init_finger(finger_id)
+
+        if len(self.position_history[finger_id]) >= 2:
+            prev_y = self.position_history[finger_id][-1][1]
+            prev_prev_y = self.position_history[finger_id][-2][1]
+            predicted_y = 2 * prev_y - prev_prev_y
+            smoothed_y = 0.6 * y + 0.4 * predicted_y
+        else:
+            smoothed_y = y
+
+        self.position_history[finger_id].append((x, smoothed_y, timestamp))
+        self.depth_history[finger_id].append(depth)
+        self.brightness_history[finger_id].append(brightness)
+
+        # Calculate velocity from last two positions
+        if len(self.position_history[finger_id]) >= 2:
+            pos_curr = self.position_history[finger_id][-1]
+            pos_prev = self.position_history[finger_id][-2]
+
+            dt = pos_curr[2] - pos_prev[2]
+            # if dt > 0:
+            #     vx = (pos_curr[0] - pos_prev[0]) / dt
+            #     vy = (pos_curr[1] - pos_prev[1]) / dt  # Positive = moving down
+            #     self.velocity_history[finger_id].append((vx, vy))
+            if dt > 0:
+                vx = (pos_curr[0] - pos_prev[0]) / dt
+                vy = (pos_curr[1] - pos_prev[1]) / dt
+
+                # CLAMP velocity to filter noise spikes
+                MAX_VELOCITY = 250.0  # px/s - realistic finger tap limit
+                vx = max(-MAX_VELOCITY, min(MAX_VELOCITY, vx))
+                vy = max(-MAX_VELOCITY, min(MAX_VELOCITY, vy))
+
+                self.velocity_history[finger_id].append((vx, vy))
+            else:
+                self.velocity_history[finger_id].append((0, 0))
+
+    def get_velocity_profile(self, finger_id: str) -> Tuple[float, bool, bool, bool, float, float]:
+        """
+        Analyze velocity to detect typing motion pattern.
+
+        Returns:
+            (current_vy, is_approaching, is_stopping, is_retracting)
+        """
+        
+        if finger_id not in self.velocity_history or len(self.velocity_history[finger_id]) < 3:
+            return (0, False, False, False, 0,0)
+        if finger_id not in self.position_history or len(self.position_history[finger_id]) < 2:
+            return (0, False, False, False, 0,0)
+        
+        
+        positions =  list(self.position_history[finger_id])
+        t_curr = positions[-1][2]
+        t_prev = positions[-2][2]
+        dt = t_curr - t_prev
+
+        if dt == 0:
+            return (0,False,False,False,0,0)
+
+        velocities = list(self.velocity_history[finger_id])
+        vx_curr, vy_curr = velocities[-1]
+        vx_prev, vy_prev = velocities[-2] if len(velocities) >= 2 else (0, 0)
+
+        acc_y_curr = (vy_curr - vy_prev) / dt
+        acc_y_prev = 0
+        if(len(velocities) >= 3):
+            acc_y_prev = (velocities[-2][1] - velocities[-3][1])/dt
+        
+        jerk = (acc_y_curr - acc_y_prev)/dt
+
+
+        # APPROACHING: Moving down fast with sustained velocity
+        is_approaching = (
+            vy_curr > self.velocity_threshold_approach and
+            vy_curr >= vy_prev * 0.85
+        )
+
+        # STOPPING: Velocity drops significantly (indicates contact)
+        velocity_drop = (
+            vy_prev > self.velocity_threshold_approach and
+            vy_curr < self.velocity_threshold_stop and
+            vy_curr < vy_prev * self.velocity_drop_ratio
+        )
+        is_stopping = velocity_drop
+
+        # RETRACTING: Moving up
+        is_retracting = vy_curr < self.velocity_threshold_retract
+
+        return (vy_curr, is_approaching, is_stopping, is_retracting, jerk, acc_y_curr)
+
+    def update_tap_state(
+        self,
+        finger_id: str,
+        vy: float,
+        is_approaching: bool,
+        is_stopping: bool,
+        is_retracting: bool
+    ) -> Optional[str]:
+        """
+        Update tap state machine.
+
+        State transitions:
+        IDLE -> APPROACHING -> CONTACT -> RETRACTING -> IDLE
+
+        Returns 'contact' when a contact event is detected.
+        """
+        current_state = self.tap_state.get(finger_id, TapState.IDLE)
+
+        if current_state == TapState.IDLE:
+            if is_approaching:
+                self.tap_state[finger_id] = TapState.APPROACHING
+                self.peak_velocity[finger_id] = vy
+
+        elif current_state == TapState.APPROACHING:
+            # Track peak velocity
+            if vy > self.peak_velocity[finger_id]:
+                self.peak_velocity[finger_id] = vy
+
+            # Transition to contact if:
+            # 1. Velocity is stopping
+            # 2. Peak velocity was high enough (deliberate tap)
+            if is_stopping and self.peak_velocity[finger_id] >= self.min_peak_velocity:
+                self.tap_state[finger_id] = TapState.CONTACT
+                self.tap_triggered[finger_id] = False
+                return 'contact'
+
+            # Reset if starts retracting without contact
+            if is_retracting:
+                self.tap_state[finger_id] = TapState.IDLE
+                self.peak_velocity[finger_id] = 0
+
+        elif current_state == TapState.CONTACT:
+            # Transition to retracting
+            if is_retracting or vy < -5:
+                self.tap_state[finger_id] = TapState.RETRACTING
+
+        elif current_state == TapState.RETRACTING:
+            # Return to idle when motion stops
+            if abs(vy) < 15 and not is_approaching and not is_retracting:
+                self.tap_state[finger_id] = TapState.IDLE
+                self.peak_velocity[finger_id] = 0
+
+        return current_state.value
+
+    def check_hysteresis(self, finger_id: str, depth_distance_cm: float) -> bool:
+        """
+        Apply threshold hysteresis for stable contact detection.
+
+        Paper methodology:
+        - Contact entry: depth < 4.5mm
+        - Contact exit: depth > 6.0mm
+        - In between: maintain previous state
+        """
+        self._init_finger(finger_id)
+
+        if depth_distance_cm < self.contact_entry_threshold_cm:
+            self.in_contact[finger_id] = True
+        elif depth_distance_cm > self.contact_exit_threshold_cm:
+            self.in_contact[finger_id] = False
+        # Else: maintain previous state (hysteresis)
+
+        return self.in_contact[finger_id]
+
+    def get_temporal_stability(self, finger_id: str) -> float:
+        """
+        Check if fingertip is stable over recent frames.
+        Returns stability score (0-1, higher = more stable).
+        """
+        if finger_id not in self.position_history:
+            return 0.0
+
+        positions = list(self.position_history[finger_id])
+        if len(positions) < 3:
+            return 0.0
+
+        xs = [p[0] for p in positions]
+        ys = [p[1] for p in positions]
+
+        x_var = np.var(xs)
+        y_var = np.var(ys)
+        total_var = x_var + y_var
+
+        # Lower variance = more stable = higher score
+        stability = 1.0 - min(total_var / 100.0, 1.0)
+        return stability
+
+    def get_brightness(self, frame: np.ndarray, x: int, y: int, radius: int = 8) -> float:
+        """Get average brightness around fingertip."""
+        try:
+            x1, y1 = max(0, x - radius), max(0, y - radius)
+            x2, y2 = min(frame.shape[1], x + radius), min(frame.shape[0], y + radius)
+
+            region = frame[y1:y2, x1:x2]
+            if region.shape[0] < 3 or region.shape[1] < 3:
+                return 0.0
+
+            if len(region.shape) == 3:
+                region_gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+            else:
+                region_gray = region
+
+            return float(np.mean(region_gray))
+        except Exception:
+            return 0.0
+
+    def check_contact(self, finger_id, frame, x, y, depth_corrected,
+                    surface_depth, timestamp, debug=False):
+        debug_info = {}
+
+        brightness = self.get_brightness(frame, x, y)
+        self.update_history(finger_id, x, y, depth_corrected, brightness, timestamp)
+        
+        smoothed_depth = self.get_smoothed_depth(finger_id)
+        distance_from_surface = surface_depth - smoothed_depth
+        distance_cm = distance_from_surface * 100
+
+        debug_info['depth_cm'] = distance_cm
+        self.distance_history[finger_id].append(distance_cm)
+
+        depth_ok = self.check_hysteresis(finger_id, distance_cm)
+        debug_info['depth_ok'] = depth_ok
+        debug_info['in_contact_hysteresis'] = self.in_contact.get(finger_id, False)
+
+        vy, is_approaching, is_stopping, is_retracting, jerk, acc_y = self.get_velocity_profile(finger_id)
+        tap_event = self.update_tap_state(finger_id, vy, is_approaching, is_stopping, is_retracting)
+        velocity_contact = (tap_event == 'contact')
+
+        if debug:
+            print(f"[DIST] {distance_cm:.2f} depth_ok={depth_ok} vel={velocity_contact}")
+
+        debug_info['velocity_y'] = vy
+        debug_info['jerk'] = jerk
+        debug_info['acc_y'] = acc_y
+        debug_info['is_approaching'] = is_approaching
+        debug_info['is_stopping'] = is_stopping
+        debug_info['is_retracting'] = is_retracting
+        debug_info['tap_state'] = self.tap_state.get(finger_id, TapState.IDLE).value
+        debug_info['velocity_contact'] = velocity_contact
+        debug_info['peak_velocity'] = self.peak_velocity.get(finger_id, 0)
+
+        stability = self.get_temporal_stability(finger_id)
+        debug_info['stability'] = stability
+
+        brightness_changed = False
+        if finger_id in self.brightness_history and len(self.brightness_history[finger_id]) >= 3:
+            brightness_history = list(self.brightness_history[finger_id])
+            brightness_change = abs(brightness - np.mean(brightness_history[:-1]))
+            brightness_changed = brightness_change > 5
+        debug_info['brightness'] = brightness
+        debug_info['brightness_changed'] = brightness_changed
+
+        if self.cooldown_counter.get(finger_id, 0) > 0:
+            self.cooldown_counter[finger_id] -= 1
+            if self.cooldown_counter[finger_id] == 0:
+                self.tap_triggered[finger_id] = False
+                self.tap_state[finger_id] = TapState.IDLE
+                self.peak_velocity[finger_id] = 0.0
+            debug_info['in_cooldown'] = True
+            return (False, 0.0, debug_info)
+        debug_info['in_cooldown'] = False
+
+        tap_quality, tap_debug = self.compute_natural_tap_quality(finger_id)
+        debug_info.update(tap_debug)
+        confidence = tap_quality
+        is_contact = False
+
+        # FIX: Wider distance gate (was 3.5cm) — smoothing lag can push dist up
+        # Replace check_contact decision logic section:
+
+# ── GATE 1: Distance must be reasonable ──────────────────────────────
+        if distance_cm > 4.0:
+            debug_info['reject'] = 'too_far'
+            return (False, confidence, debug_info)
+
+        if vy < -8:
+            self.tap_triggered[finger_id] = False
+            debug_info['reject'] = 'moving_up'
+            return (False, confidence, debug_info)
+
+        # ── GATE 2: Require minimum velocity evidence ─────────────────────────
+        # peak_vy from compute_natural_tap_quality uses velocity history
+        peak_vy = debug_info.get('peak_vy', 0.0)
+
+        # A real tap MUST have some downward velocity in recent history.
+        # Hovering fingers have peak < 15px/s.
+        MIN_PEAK_FOR_SCORE_PATH = 18.0   # px/s — must show intent
+        MIN_PEAK_FOR_VELOCITY_PATH = self.min_peak_velocity  # 25px/s
+
+        # ── PATH A: Velocity-confirmed (state machine fired) ──────────────────
+        velocity_confirmed = (
+    velocity_contact and
+    distance_cm < 2.0 and   # was 2.5
+    peak_vy >= MIN_PEAK_FOR_VELOCITY_PATH and
+    confidence >= 0.5
+)
+
+        # ── PATH B: Score-confirmed (no state machine) ────────────────────────
+        # Stricter: needs depth_ok, good score, AND minimum velocity evidence
+        score_confirmed = (
+    confidence >= self.confidence_threshold and
+    depth_ok and
+    distance_cm < 2.0 and   # was 2.5
+    peak_vy >= MIN_PEAK_FOR_SCORE_PATH
+)
+
+        debug_info['peak_vy_gate'] = peak_vy
+        debug_info['velocity_confirmed'] = velocity_confirmed
+        debug_info['score_confirmed'] = score_confirmed
+
+        if velocity_confirmed or score_confirmed:
+            if not self.tap_triggered.get(finger_id, False):
+                self.tap_triggered[finger_id] = True
+                is_contact = True
+                self.cooldown_counter[finger_id] = 20
+                self.last_tap_time[finger_id] = time.time()
+                self.tap_velocity_at_trigger[finger_id] = peak_vy
+                reason = 'velocity' if velocity_confirmed else 'score'
+                print(f"[TAP] {finger_id} | {reason} | score={confidence:.2f} | dist={distance_cm:.1f}cm | peak={peak_vy:.0f}px/s")
+
+        if distance_cm > 4.2:
+            self.tap_triggered[finger_id] = False
+
+        debug_info['confidence'] = confidence
+        debug_info['contact_frames'] = 1 if is_contact else 0
+        debug_info['natural_tap'] = is_contact
+
+        if debug and confidence > 0.25:
+            print(
+                f"[TAPDBG] q={confidence:.2f} dist={distance_cm:.2f}cm "
+                f"peak={debug_info.get('peak_vy', 0):.1f} "
+                f"dwell={debug_info.get('low_vel_dwell', 0)} "
+                f"reject={debug_info.get('reject', '')}"
+            )
+
+        return (is_contact, confidence, debug_info)
+
+class VRKeyboardCVPR2026:
+    """
+    VR Keyboard implementation matching CVPR 2026 paper methodology.
+
+    Features:
+    - Fine-tuned Depth Anything V2 for depth estimation
+    - Velocity-based tap detection with state machine
+    - Threshold hysteresis for stable contact detection
+    - Multi-modal fusion (depth + motion)
+    - Real-time performance metrics
+    """
+
+    SPECIAL_KEYS = {
+        'backspace': 'BACKSPACE', 'Backspace': 'BACKSPACE', 'back': 'BACKSPACE',
+        'delete': 'DELETE', 'Delete': 'DELETE', 'del': 'DELETE',
+        'space': 'SPACE', 'Space': 'SPACE', 'SPACE': 'SPACE',
+        'enter': 'ENTER', 'Enter': 'ENTER', 'return': 'ENTER',
+        'shift': 'SHIFT', 'Shift': 'SHIFT',
+        'tab': 'TAB', 'Tab': 'TAB',
+        'caps': 'CAPS', 'Caps': 'CAPS',
+        'ctrl': 'CTRL', 'Ctrl': 'CTRL',
+        'alt': 'ALT', 'Alt': 'ALT',
+        'win': 'WIN', 'Win': 'WIN',
+        'esc': 'ESC', 'Esc': 'ESC',
+        'B.Spa': 'BACKSPACE', 'B.spa': 'BACKSPACE',
+    }
+
+    def __init__(
+        self,
+        annotation_file: str = './assets/keyboard_annotations.json',
+        depth_checkpoint: str = None,
+        threshold_cm: float = 0.8,
+        camera_id: int = 0,
+        use_real_keyboard: bool = True,
+        track_all_fingers: bool = False,  # Index only by default
+        debug_mode: bool = False
+    ):
+        print("=" * 70)
+        print("  VR KEYBOARD - CVPR 2026 IMPLEMENTATION (V1)")
+        print("  Real-Time Multimodal Fingertip Contact Detection")
+        print("=" * 70)
+        self._log_data = []
+
+        # RealSense D405 provides depth directly — no separate depth model needed
+        self.depth_estimator = None
+        self.depth_checkpoint_path = None
+
+        # Initialize contact detector
+        print("[LOADING] Velocity-based contact detector...")
+        self.contact_detector = VelocityBasedContactDetector(
+            history_size=30,
+            contact_entry_threshold_cm=1.8,
+            contact_exit_threshold_cm=3.0,
+            cooldown_frames=15,
+            min_peak_velocity=25.0,
+            velocity_threshold_approach=15.0,
+            velocity_threshold_stop=6.0,
+            confidence_threshold=0.60
+        )
+        self.tip_power_estimator = TipPowerEstimator(
+        area_radius=14,
+        velocity_scale=80.0)
+        self.last_tip_powers: Dict[str, float] = {}
+
+        # Initialize MediaPipe hands
+        print("[LOADING] Hand tracking (MediaPipe)...")
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            min_detection_confidence=0.6, #0.4,
+            min_tracking_confidence=0.6, #0.5,
+            model_complexity=1  # Use higher complexity for better accuracy
+        )
+        self.mp_draw = mp.solutions.drawing_utils
+
+        # Load keyboard layout
+        print("[LOADING] Keyboard layout...")
+        self.keys = self._load_keyboard_annotation(annotation_file)
+
+        # Initialize RealSense D405
+        print("[LOADING] RealSense D405...")
+        
+
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
+
+        # D405 default: 640x480 @ 30fps for both depth and color
+        self.config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        self.config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+
+        try:
+            self.pipeline.start(self.config)
+            self.align = rs.align(rs.stream.color)
+            print("[SUCCESS] D405 connected")
+        except Exception as e:
+            raise RuntimeError(f"Cannot start D405: {e}")
+
+        # Get depth scale (convert raw depth to meters)
+        profile = self.pipeline.get_active_profile()
+        depth_sensor = profile.get_device().first_depth_sensor()
+        self.depth_scale = depth_sensor.get_depth_scale()
+        print(f"[INFO] Depth scale: {self.depth_scale}") # Neutral brightness
+
+        # Keyboard controller
+        self.use_real_keyboard = use_real_keyboard and PYNPUT_AVAILABLE
+        if self.use_real_keyboard:
+            self.keyboard_controller = Controller()
+            print("[ENABLED] Real keyboard simulation")
+        else:
+            self.keyboard_controller = None
+            print("[DISABLED] Real keyboard simulation")
+
+        # Calibration parameters
+        self.depth_scale_factor = None
+        self.actual_distance_m = None
+        self.typing_threshold_m = threshold_cm / 100.0
+        self.keyboard_surface_depth = None
+        self.is_calibrated = False
+
+
+        self.riesz_viz = RieszVisualizer(history_len=60, width=200, height=300)
+        # State
+        self.typed_text = ""
+        self.reference_text = ""
+        self.use_key_bias = False
+        self.last_keys_pressed = {}
+        self.shift_active = False
+        self.caps_lock = False
+
+        # Depth frame skip for performance (reduced for speed)
+        self.depth_frame_skip = 2
+        self.depth_frame_counter = 0
+        self.cached_depth_map = None
+
+        # Finger tracking configuration
+        self.track_all_fingers = track_all_fingers
+        if track_all_fingers:
+            self.fingertip_landmarks = [
+                self.mp_hands.HandLandmark.THUMB_TIP,
+                self.mp_hands.HandLandmark.INDEX_FINGER_TIP,
+                self.mp_hands.HandLandmark.MIDDLE_FINGER_TIP,
+                self.mp_hands.HandLandmark.RING_FINGER_TIP,
+                self.mp_hands.HandLandmark.PINKY_TIP,
+            ]
+        else:
+            self.fingertip_landmarks = [
+                self.mp_hands.HandLandmark.INDEX_FINGER_TIP,
+            ]
+
+        # Performance tracking
+        self.fps = 0
+        self.frame_times = []
+        self.debug_mode = debug_mode
+        self.last_pressed_key_visual = None
+        self.last_pressed_key_frames = 0
+
+        # Metrics
+        # self.contact_metrics = ContactMetrics()
+        self.typing_metrics = TypingMetrics()
+
+        self._print_config()
+    @property
+    def current_model_name(self):
+        return os.path.basename(self.depth_checkpoint_path) if self.depth_checkpoint_path else "Unknown"
+
+    # In vr_keyboard_cvpr2026_v6.py, add auto-calibration:
+
+    # def auto_calibrate_keyboard(self, depth_map):
+    #     """
+    #     Automatically calibrate using keyboard plane detection.
+    #     Fits a plane to multiple keyboard points for robust scale estimation.
+    #     """
+    #     import cv2
+    #     import numpy as np
+        
+    #     # Sample 9 points across keyboard (corners + center + edges)
+    #     h, w = depth_map.shape
+    #     sample_points = [
+    #         (w//4, h//4), (w//2, h//4), (3*w//4, h//4),      # Top row
+    #         (w//4, h//2), (w//2, h//2), (3*w//4, h//2),      # Middle row
+    #         (w//4, 3*h//4), (w//2, 3*h//4), (3*w//4, 3*h//4) # Bottom row
+    #     ]
+        
+    #     depths = [depth_map[y, x] for x, y in sample_points]
+    #     median_depth = np.median(depths)
+        
+    #     # Assume keyboard is ~37cm away (adjust to your setup)
+    #     KNOWN_KEYBOARD_DISTANCE = 0.37  # meters
+    #     self.depth_scale_factor = KNOWN_KEYBOARD_DISTANCE / median_depth
+    #     self.keyboard_surface_depth = KNOWN_KEYBOARD_DISTANCE
+    #     self.is_calibrated = True
+        
+    #     print(f"\n[AUTO-CALIBRATED]")
+    #     print(f"  Median raw depth: {median_depth:.3f}m")
+    #     print(f"  Scale factor: {self.depth_scale_factor:.4f}")
+    #     print(f"  Surface depth: {KNOWN_KEYBOARD_DISTANCE*100:.1f}cm\n")
+
+    # In vr_keyboard_cvpr2026_v6.py, add this method to VRKeyboardCVPR2026 class
+    # Add it right after the calibrate_keyboard_surface() method (around line 850)
+
+
+    def _get_biased_key_score(self, key: Dict, contact_x: int, contact_y: int,
+                           bias_px: int = 13) -> float:
+        corners = key['corners'].astype(np.float32)
+        key_name = self._normalize_key_name(key['name'])
+        
+        is_expected = False
+        if self.use_key_bias and self.reference_text:
+            typed_len = len(self.typed_text)
+            if typed_len < len(self.reference_text):
+                expected_char = self.reference_text[typed_len].lower()
+                if key_name.lower() == expected_char:
+                    is_expected = True
+        
+        if is_expected:
+            center = np.mean(corners, axis=0)
+            inflated = []
+            for corner in corners:
+                direction = corner - center
+                norm = np.linalg.norm(direction)
+                if norm > 0:
+                    inflated.append(corner + (direction / norm) * bias_px)
+                else:
+                    inflated.append(corner)
+            inflated = np.array(inflated, dtype=np.float32)
+            score = cv2.pointPolygonTest(inflated, (float(contact_x), float(contact_y)), True)
+            if score >= 0:
+                print(f"[BIAS] {key_name} matched via inflated polygon")
+            return score
+        else:
+            return cv2.pointPolygonTest(corners, (float(contact_x), float(contact_y)), True)
+
+    def _find_key_at_point(self, x: int, y: int, margin_px: int = 14, confidence: float = 1.0) -> Tuple[Optional[Dict], float]:
+        """
+        Find key under contact point using polygon distance.
+        Positive score = inside key.
+        Negative score = outside key but near boundary.
+
+        margin_px allows natural typing near key edges.
+        """
+        best_key = None
+        best_score = -1e9
+
+        point = (float(x), float(y))
+
+        for key in self.keys:
+            corners = key['corners'].astype(np.float32)
+
+            # signed distance:
+            # > 0 inside polygon
+            # = 0 on edge
+            # < 0 outside polygon
+            signed_dist = self._get_gaussian_key_score(key, int(point[0]), int(point[1]), sigma_base=14.0)
+
+
+            key_name = self._normalize_key_name(key['name'])
+
+            local_margin = margin_px
+            if key_name in ['SPACE', 'ENTER', 'BACKSPACE']:
+                local_margin += 8
+
+            if signed_dist > -999.0 and signed_dist > best_score:
+                best_score = signed_dist
+                best_key = key
+
+        return best_key, best_score
+
+    def auto_calibrate_keyboard(self, depth_map: np.ndarray, known_distance_cm: float = 32.5):
+        print("\n" + "=" * 70)
+        print("[AUTO-CALIBRATION] Measuring keyboard plane...")
+        print("=" * 70)
+        
+        h, w = depth_map.shape
+        sample_points = [
+            (w//4, h//3), (w//2, h//3), (3*w//4, h//3),
+            (w//4, h//2), (w//2, h//2), (3*w//4, h//2),
+            (w//4, 2*h//3), (w//2, 2*h//3), (3*w//4, 2*h//3)
+        ]
+        
+        depths = [self._get_depth_at_point(depth_map, x, y) for x, y in sample_points]
+        for (x, y), d in zip(sample_points, depths):
+            print(f"  Point ({x:3d}, {y:3d}): {d:.3f}m")
+
+        # Use the CLOSEST valid readings (keyboard is nearest flat surface)
+        valid_depths = [d for d in depths if 0.1 < d < 1.0]
+        if len(valid_depths) < 4:
+            print("[ERROR] Not enough valid depth readings!")
+            return
+
+        # Take the lowest (closest) values — these should be the keyboard
+        valid_depths.sort()
+        median_depth = float(np.median(valid_depths[:5]))
+        std_depth = float(np.std(valid_depths[:5]))
+
+        # Reject bad calibration (hand over keyboard = high variance / wrong scale)
+        if std_depth > 0.015:
+            print(f"[WARNING] Calibration unstable (std={std_depth:.3f}m).")
+            print("[WARNING] Keep hands AWAY from keyboard! Press 'C' to retry, or restart.")
+            # Don't calibrate with bad data
+            return
+
+        print(f"\n  Statistics:")
+        print(f"    Median depth: {median_depth:.3f}m")
+        print(f"    Std deviation: {std_depth:.3f}m")
+        print(f"    Using {len(valid_depths[:5])} closest readings")
+        
+        self.actual_distance_m = known_distance_cm / 100.0
+        self.depth_scale_factor = self.actual_distance_m / median_depth if median_depth > 0 else 1.0
+        self.keyboard_surface_depth = self.actual_distance_m
+        self.is_calibrated = True
+        
+        print(f"\n[SUCCESS] Auto-calibrated!")
+        print(f"  Scale factor: {self.depth_scale_factor:.4f}")
+        print(f"  Surface depth: {self.keyboard_surface_depth * 100:.1f}cm")
+        print("=" * 70 + "\n")
+        print("[READY] Start typing!")
+        
+        self.typing_metrics = TypingMetrics()
+    def _print_config(self):
+        """Print configuration summary."""
+        print("\n" + "=" * 70)
+        print("  CONFIGURATION (CVPR 2026 Paper Settings)")
+        print("=" * 70)
+        print(f"  Threshold Hysteresis:")
+        print(f"    - Contact entry: {self.contact_detector.contact_entry_threshold_cm * 10:.1f}mm")
+        print(f"    - Contact exit: {self.contact_detector.contact_exit_threshold_cm * 10:.1f}mm")
+        print(f"  Velocity Detection:")
+        print(f"    - Approach threshold: {self.contact_detector.velocity_threshold_approach} px/s")
+        print(f"    - Min peak velocity: {self.contact_detector.min_peak_velocity} px/s")
+        print(f"  Cooldown: {self.contact_detector.cooldown_frames} frames")
+        print(f"  Confidence threshold: {self.contact_detector.confidence_threshold}")
+        print(f"  Tracking: {'All fingers' if self.track_all_fingers else 'Index finger only'}")
+        print("=" * 70)
+        # ← UPDATE THIS LINE:
+        print("\n[CALIBRATION] Press 'A' for auto-calibration OR 'C' after clicking surface")
+        print("[CONTROLS] A=Auto-Cal | C=Manual-Cal | D=Debug | M=Metrics | Q=Quit")
+        print("=" * 70 + "\n")
+
+    def _load_keyboard_annotation(self, filename: str) -> List[Dict]:
+        """Load keyboard annotation from JSON file."""
+        try:
+            with open(filename, 'r') as f:
+                data = json.load(f)
+
+            keys = []
+            if isinstance(data, list):
+                for key_obj in data:
+                    key_name = key_obj.get('key', 'UNKNOWN')
+                    points = key_obj.get('points', [])
+                    if len(points) == 4:
+                        corners = [[p['x'], p['y']] for p in points]
+                        keys.append({
+                            'name': key_name,
+                            'corners': np.array(corners, dtype=np.float32),
+                            'center': np.mean(corners, axis=0).astype(int)
+                        })
+
+            print(f"   [SUCCESS] Loaded {len(keys)} keys")
+            return keys
+        except FileNotFoundError:
+            print(f"[ERROR] {filename} not found")
+            return []
+
+    def calibrate_keyboard_surface(self, depth_map: np.ndarray, point: Tuple[int, int]):
+        """Calibrate keyboard surface depth."""
+        x, y = point
+        raw_depth = self._get_depth_at_point(depth_map, x, y)
+
+        print("\n" + "=" * 70)
+        print("[CALIBRATION] Depth Measurement")
+        print("=" * 70)
+        print(f"  Raw model depth: {raw_depth:.3f}m")
+        print("\n[ACTION] Enter actual distance to keyboard in cm:")
+
+        try:
+            user_input = input("Distance (cm): ").strip()
+            actual_cm = float(user_input)
+            self.actual_distance_m = actual_cm / 100.0
+            self.depth_scale_factor = self.actual_distance_m / raw_depth if raw_depth > 0 else 1.0
+            self.keyboard_surface_depth = self.actual_distance_m
+            self.is_calibrated = True
+
+            print("\n[SUCCESS] Calibrated!")
+            print(f"  Scale factor: {self.depth_scale_factor:.4f}")
+            print(f"  Surface depth: {self.keyboard_surface_depth * 100:.1f}cm")
+            print("=" * 70 + "\n")
+            print("[READY] Start typing!")
+
+            # Reset metrics
+            self.typing_metrics = TypingMetrics()
+        except ValueError:
+            print("[ERROR] Invalid input!")
+
+    def _get_depth_at_point(self, depth_map, x, y, patch: int = 7) -> float:
+        h, w = depth_map.shape[:2]
+        x = max(0, min(x, w - 1)); y = max(0, min(y, h - 1))
+        x1 = max(0, x - patch); y1 = max(0, y - patch)
+        x2 = min(w, x + patch + 1); y2 = min(h, y + patch + 1)
+        region = depth_map[y1:y2, x1:x2]
+        valid = region[np.isfinite(region)]
+        valid = valid[valid > 0]
+        if valid.size == 0:
+            return float(depth_map[y, x])
+        valid = np.sort(valid)
+        k = max(1, int(valid.size * 0.25))   # closest 40% = the finger, not background
+        return float(np.median(valid[:k]))
+
+    def _correct_depth(self, raw_depth: float) -> float:
+        """Apply depth correction using calibration."""
+        if self.depth_scale_factor is None:
+            return raw_depth
+        return raw_depth * self.depth_scale_factor
+
+    # def _estimate_depth(self, frame: np.ndarray) -> np.ndarray:
+    #     """Estimate depth from frame."""
+    #     if self.depth_estimator is None:
+    #         # Mock depth map
+    #         return np.full(frame.shape[:2], 0.35, dtype=np.float32)
+
+    #     # Skip frames for performance
+    #     self.depth_frame_counter += 1
+    #     if self.depth_frame_counter % self.depth_frame_skip == 0 or self.cached_depth_map is None:
+    #         self.cached_depth_map = self.depth_estimator.estimate_depth(frame)
+
+    #     return self.cached_depth_map
+
+    def _get_fingertip_depth(
+        self,
+        depth_map: np.ndarray,
+        hand_landmarks,
+        fingertip_id: int,
+        image_shape: Tuple[int, int]
+    ) -> Tuple[int, int, float, float]:
+        """Get fingertip position and depth."""
+        fingertip = hand_landmarks.landmark[fingertip_id]
+        h, w = image_shape
+        x = int(fingertip.x * w)
+        y = int(fingertip.y * h)
+        x = max(0, min(x, w - 1))
+        y = max(0, min(y, h - 1))
+        raw_depth = self._get_depth_at_point(depth_map, x, y)
+        corrected_depth = self._correct_depth(raw_depth)
+        return (x, y, corrected_depth, raw_depth)
+
+    def _is_fingertip_on_key(self, fingertip_pos: Tuple[int, int], key: Dict) -> bool:
+        """Check if fingertip is over a key."""
+        x, y = fingertip_pos[:2]
+        point = np.array([x, y], dtype=np.float32)
+        result = cv2.pointPolygonTest(key['corners'], tuple(point), False)
+        return result >= 0
+
+    def _normalize_key_name(self, key_name: str) -> str:
+        """Normalize key names."""
+        return self.SPECIAL_KEYS.get(key_name, key_name)
+
+    def _simulate_keypress(self, key_name: str):
+        """Simulate keyboard press."""
+        if not self.use_real_keyboard or self.keyboard_controller is None:
+            return
+        try:
+            normalized = self._normalize_key_name(key_name)
+            if normalized == 'BACKSPACE':
+                self.keyboard_controller.press(Key.backspace)
+                self.keyboard_controller.release(Key.backspace)
+            elif normalized == 'SPACE':
+                self.keyboard_controller.press(Key.space)
+                self.keyboard_controller.release(Key.space)
+            elif normalized == 'ENTER':
+                self.keyboard_controller.press(Key.enter)
+                self.keyboard_controller.release(Key.enter)
+            elif normalized not in ['SHIFT', 'CAPS', 'CTRL', 'ALT', 'WIN', 'ESC', 'TAB', 'DELETE']:
+                char = key_name.lower() if not (self.shift_active or self.caps_lock) else key_name.upper()
+                if len(char) == 1:
+                    self.keyboard_controller.type(char)
+        except Exception as e:
+            print(f"[ERROR] Keypress failed: {e}")
+
+    def _handle_key_press(self, key_name: str) -> bool:
+        """Handle key press event."""
+        normalized = self._normalize_key_name(key_name)
+
+        if normalized == 'BACKSPACE':
+            if len(self.typed_text) > 0:
+                self.typed_text = self.typed_text[:-1]
+            self._simulate_keypress(key_name)
+            print(f"[BACKSPACE]")
+            self.contact_detector.metrics.total_taps += 1
+            self.contact_detector.metrics.true_positives += 1
+            return True
+            
+        elif normalized == 'DELETE':
+            self.typed_text = ""
+            print(f"[DELETE - Cleared]")
+            self.contact_detector.metrics.total_taps += 1
+            self.contact_detector.metrics.true_positives += 1
+            return True
+            
+        elif normalized == 'CAPS':
+            self.caps_lock = not self.caps_lock
+            print(f"[CAPS LOCK] {'ON' if self.caps_lock else 'OFF'}")
+            # Don't count CAPS as a tap
+            return True
+            
+        elif normalized == 'SPACE':
+            self.typed_text += ' '
+            self.typing_metrics.total_words += 1
+            self._simulate_keypress(key_name)
+            print(f"[SPACE]")
+            self.contact_detector.metrics.total_taps += 1
+            self.contact_detector.metrics.true_positives += 1
+            return True
+            
+        elif normalized == 'ENTER':
+            self.typed_text += '\n'
+            self._simulate_keypress(key_name)
+            print(f"[ENTER]")
+            self.contact_detector.metrics.total_taps += 1
+            self.contact_detector.metrics.true_positives += 1
+            return True
+            
+        elif normalized == 'SHIFT':
+            self.shift_active = not self.shift_active
+            print(f"[SHIFT] {'ON' if self.shift_active else 'OFF'}")
+            # Don't count SHIFT as a tap
+            return True
+            
+        elif normalized in ['CTRL', 'ALT', 'WIN', 'ESC', 'TAB']:
+            # Ignore modifier keys to prevent accidents
+            print(f"[{normalized}] - IGNORED (modifier key)")
+            self.contact_detector.metrics.false_positives += 1
+            return False
+            
+        else:
+            # Regular character
+            char = key_name
+            if len(char) == 1:
+                if self.shift_active or self.caps_lock:
+                    char = char.upper()
+                    if self.shift_active:
+                        self.shift_active = False
+                else:
+                    char = char.lower()
+            self.typed_text += char
+            self.typing_metrics.total_characters += 1
+            self.typing_metrics.correct_characters += 1
+            self._simulate_keypress(key_name)
+            print(f"[Key: {char}]")
+            self.contact_detector.metrics.total_taps += 1
+            self.contact_detector.metrics.true_positives += 1
+            return True
+
+
+    def _get_gaussian_key_score(self, key: dict, contact_x: int, contact_y: int,
+                                sigma_base: float = 18.0, confidence: float = 1.0) -> float:
+        """
+        Returns Gaussian log-probability of touch point under key center.
+        sigma expands when confidence is low (uncertainty-aware, per TouchInsight).
+        Falls back to polygon for hard rejection of far-away keys.
+        """
+        corners = key['corners'].astype(np.float32)
+        
+        # Hard reject if outside inflated polygon (2x normal size)
+        center = np.mean(corners, axis=0)
+        inflated = []
+        for corner in corners:
+            d = corner - center
+            norm = np.linalg.norm(d)
+            inflated.append(corner + (d / norm) * 20 if norm > 0 else corner)
+        if cv2.pointPolygonTest(np.array(inflated, np.float32),
+                                (float(contact_x), float(contact_y)), False) < 0:
+            return -999.0
+
+        # Gaussian score
+        sigma = sigma_base / max(confidence, 0.3)  # widen when uncertain
+        
+        # Key bias: shrink sigma for expected next key
+        if self.use_key_bias and self.reference_text:
+            typed_len = len(self.typed_text)
+            if typed_len < len(self.reference_text):
+                expected = self.reference_text[typed_len].lower()
+                if self._normalize_key_name(key['name']).lower() == expected:
+                    sigma *= 0.7  # tighter = higher score for expected key
+
+        dx = contact_x - center[0]
+        dy = contact_y - center[1]
+        score = -0.5 * (dx**2 + dy**2) / (sigma**2)
+        return score
+
+    def _check_key_press(self, finger_id, frame, x, y, depth_corrected, timestamp):
+        if not self.is_calibrated or self.keyboard_surface_depth is None:
+            return (None, 0.0, {})
+        
+        raw_dist_cm = (self.keyboard_surface_depth - depth_corrected) * 100
+        if raw_dist_cm < -5.0 or raw_dist_cm > 15.0:  # very loose — just catch sensor errors
+            return (None, 0.0, {'rejected': 'sensor_error', 'distance_cm': raw_dist_cm})
+    
+        is_contact, confidence, debug_info = self.contact_detector.check_contact(
+    finger_id, frame, x, y, depth_corrected,
+    self.keyboard_surface_depth, timestamp, debug=self.debug_mode)
+
+        self.riesz_viz.update(
+            r0=debug_info.get('depth_cm', 0),
+            r1=debug_info.get('velocity_y', 0),
+            r2=debug_info.get('acc_y', 0),
+            r3=debug_info.get('jerk', 0)
+        )
+
+        impact_vy = abs(debug_info.get('velocity_y', 0.0))
+        tip_power, power_debug = self.tip_power_estimator.estimate(
+            frame, finger_id, x, y,
+            impact_velocity=impact_vy,
+            is_contact=is_contact)
+        debug_info.update(power_debug)
+        self.last_tip_powers[finger_id] = tip_power
+
+        #FOR NOW
+        # if is_contact:
+        #     if tip_power < 0.10:
+        #         is_contact = False
+        #         debug_info['rejected_ghost'] = True
+        #     elif tip_power > 0.55:
+        #         confidence = min(confidence * 1.25, 1.0)
+
+        if is_contact:
+            # Contact happens at finger pad, slightly below MediaPipe fingertip.
+            contact_x = x
+            contact_y = y + 5
+
+            cv2.circle(frame, (contact_x, contact_y), 5, (0, 255, 255), -1)
+
+            best_key, key_score = self._find_key_at_point(contact_x, contact_y, margin_px=22, confidence=confidence)
+
+            if best_key is not None and key_score > -999.0:
+                if self.debug_mode:
+                    print(f"[KEY SELECTED] {best_key['name']} polygon_score={key_score:.1f}")
+                return (best_key['name'], confidence, debug_info)
+            else:
+                debug_info['rejected_outside_polygon'] = True
+
+        return (None, confidence, debug_info)
+        # if is_contact:
+        #     # ← ADD FINGER PAD OFFSET:
+        #     # Fingertip TIP is detected, but contact happens at PAD (5-10mm below)
+        #     # In image space, this is approximately 15-20 pixels down
+        #     # FINGER_PAD_OFFSET_Y = 18  # pixels (tune this for your camera/hand size)
+        #     contact_x = x
+        #     contact_y = y + 18  # Move contact point down
+        #     # contact_y = y + FINGER_PAD_OFFSET_Y  # Move contact point down
+        #     # Find ALL keys within 40px radius
+        # # Find BEST key by closest center (not just any key within polygon)
+        # best_key = None
+        # best_distance = float('inf')
+
+        # for key in self.keys:
+        #     center_x, center_y = key['center']
+        #     distance = np.sqrt((contact_x - center_x)**2 + (contact_y - center_y)**2)
+
+        #     # Must be reasonably close (within 50px of center)
+        #     if distance < 50 and distance < best_distance:
+        #         best_distance = distance
+        #         best_key = key
+
+        # if best_key:
+        #     if self.debug_mode:
+        #         print(f"[KEY SELECTED] {best_key['name']} (dist: {best_distance:.1f}px)")
+        #     return (best_key['name'], confidence, debug_info)
+
+        # return (None, confidence, debug_info)
+        #     nearby_keys = []
+        #     for key in self.keys:
+        #         center_x, center_y = key['center']
+        #         distance = np.sqrt((contact_x - center_x)**2 + (contact_y - center_y)**2)
+        #         if distance < 60:  # Within 60px
+        #             nearby_keys.append((key['name'], distance))
+            
+        #     if nearby_keys:
+        #         print(f"[NEARBY KEYS] {nearby_keys}")
+        #     # Draw both points on frame for calibration
+        #     cv2.circle(frame, (x, y), 8, (255, 0, 255), 2)  # Magenta = TIP
+        #     cv2.circle(frame, (contact_x, contact_y), 8, (0, 255, 255), -1)  # Cyan = CONTACT POINT
+        #     cv2.line(frame, (x, y), (contact_x, contact_y), (255, 255, 0), 2)  # Yellow line
+
+        #     # Now check which key is at the CONTACT point (not tip point)
+        #     for key in self.keys:
+        #         if self._is_fingertip_on_key((contact_x, contact_y), key):
+        #             return (key['name'], confidence, debug_info)
+
+        # return (None, confidence, debug_info)
+
+
+            #for key in self.keys:
+             #   if self._is_fingertip_on_key((x, y), key):
+              #      return (key['name'], confidence, debug_info)
+
+        #return (None, confidence, debug_info)
+
+    def _draw_keyboard(self, frame: np.ndarray):
+        """Draw keyboard overlay."""
+        overlay = frame.copy()
+        for key in self.keys:
+            corners = key['corners'].astype(int)
+            key_name = self._normalize_key_name(key['name'])
+
+            # Color based on key type
+            if key_name in ['SPACE', 'ENTER', 'BACKSPACE']:
+                fill_color = (50, 70, 50)
+                outline_color = (100, 150, 100)
+            else:
+                fill_color = (50, 50, 50)
+                outline_color = (100, 100, 100)
+
+            # Highlight pressed key
+            if self.last_pressed_key_visual == key['name'] and self.last_pressed_key_frames > 0:
+                fill_color = (0, 200, 0)
+                outline_color = (0, 255, 0)
+
+            cv2.polylines(frame, [corners], True, outline_color, 2)
+            cv2.fillPoly(overlay, [corners], fill_color)
+
+            # Key label
+            center = key['center']
+            label = key['name'].upper()
+            if key_name == 'BACKSPACE':
+                label = 'BKSP'
+
+            cv2.putText(frame, label, tuple(center - [10, -5]),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+        cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
+
+    def _draw_ui(self, frame: np.ndarray):
+        """Draw UI elements."""
+        h, w = frame.shape[:2]
+        overlay = frame.copy()
+
+        # Status bar
+        status = "Calibrated" if self.is_calibrated else "Not Calibrated - Press C"
+        color = (0, 255, 0) if self.is_calibrated else (0, 165, 255)
+        cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+        # FPS
+        cv2.putText(frame, f"FPS: {self.fps:.1f}", (w - 100, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        # Bottom panel
+        cv2.rectangle(overlay, (0, h - 80), (w, h), (0, 0, 0), -1)
+        if self.last_tip_powers:
+            avg_power = float(np.mean(list(self.last_tip_powers.values())))
+            label_str = self.tip_power_estimator.power_to_label(avg_power)
+
+            # Colors: green → yellow → red
+            r_col = int(255 * avg_power)
+            g_col = int(255 * (1 - avg_power))
+            bar_color = (50, g_col, r_col)
+
+            # --- BIG BAR ---
+            bar_x, bar_y = 10, h - 130
+            bar_w, bar_h = 200, 18  # wider and taller
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (40, 40, 40), -1)
+            fill = int(bar_w * avg_power)
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill, bar_y + bar_h), bar_color, -1)
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (180, 180, 180), 2)  # border
+
+            # --- LABEL above bar ---
+            cv2.putText(frame, f"TIP POWER: {label_str.upper()} ({avg_power:.2f})",
+                (bar_x, bar_y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, bar_color, 2)
+
+            # --- CIRCULAR GAUGE (top-right corner) ---
+            gauge_cx, gauge_cy = w - 60, 80
+            gauge_r = 40
+            cv2.circle(frame, (gauge_cx, gauge_cy), gauge_r, (40, 40, 40), -1)
+            cv2.circle(frame, (gauge_cx, gauge_cy), gauge_r, (180, 180, 180), 2)
+            # Arc sweep: -210° to +30° (240° total sweep like a speedometer)
+            start_angle = -210
+            sweep = int(240 * avg_power)
+            if sweep > 0:
+                cv2.ellipse(frame, (gauge_cx, gauge_cy), (gauge_r - 6, gauge_r - 6),
+                            0, start_angle, start_angle + sweep, bar_color, 5)
+            cv2.putText(frame, label_str[:3].upper(), (gauge_cx - 18, gauge_cy + 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2)
+            cv2.putText(frame, "PWR", (gauge_cx - 16, gauge_cy + 52),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
+        cv2.addWeighted(overlay, 0.8, frame, 0.2, 0, frame)
+
+        # Legend
+        legend_y = h - 65
+        cv2.arrowedLine(frame, (10, legend_y), (10, legend_y + 15), (0, 165, 255), 2, tipLength=0.3)
+        cv2.putText(frame, "Approaching", (20, legend_y + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+
+        cv2.circle(frame, (125, legend_y + 8), 7, (0, 255, 0), -1)
+        cv2.putText(frame, "Contact!", (140, legend_y + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
+
+        cv2.arrowedLine(frame, (230, legend_y + 15), (230, legend_y), (255, 100, 100), 2, tipLength=0.3)
+        cv2.putText(frame, "Retracting", (240, legend_y + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+
+        # Typed text
+        cv2.putText(frame, "Typed:", (10, h - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        display_text = self.typed_text[-50:] if len(self.typed_text) > 50 else self.typed_text
+        cv2.putText(frame, display_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Metrics (if debug mode)
+        if self.debug_mode:
+            metrics_y = 60
+            wpm = self.typing_metrics.wpm
+            cv2.putText(frame, f"WPM: {wpm:.1f}", (10, metrics_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+
+    def print_metrics(self):
+        """Print current performance metrics."""
+        print("\n" + "=" * 70)
+        print("  PERFORMANCE METRICS")
+        print("=" * 70)
+        print(f"  Typing Metrics:")
+        print(f"    - WPM: {self.typing_metrics.wpm:.1f}")
+        print(f"    - CER: {self.typing_metrics.cer * 100:.1f}%")  # ← ADD THIS
+        print(f"    - Total characters: {self.typing_metrics.total_characters}")
+        print(f"    - Total words: {self.typing_metrics.total_characters / 5.0:.1f}")  # ← Changed
+        print(f"\n  Contact Detection Metrics:")
+        print(f"    - Total taps: {self.contact_detector.metrics.total_taps}")  # ← Already correct
+        print(f"    - Total frames: {self.contact_detector.metrics.total_frames}")  # ← Already correct
+        print(f"    - Accuracy: {self.contact_detector.metrics.accuracy * 100:.1f}%")  # ← ADD THIS
+        print(f"    - F1-Score: {self.contact_detector.metrics.f1_score * 100:.1f}%")  # ← ADD THIS
+
+
+        if self.last_tip_powers:
+            avg_power = float(np.mean(list(self.last_tip_powers.values())))
+            print(f"\n  Tip Power:")
+            print(f"    - Score: {avg_power:.3f}")
+            print(f"    - Level: {self.tip_power_estimator.power_to_label(avg_power)}")
+
+
+
+        print("=" * 70 + "\n")
+
+
+
+        import pandas as pd
+        if self._log_data:
+            pd.DataFrame(self._log_data).to_csv('depth_velocity_log.csv', index=False)
+            print(f"[SAVED] {len(self._log_data)} samples to depth_velocity_log.csv")
+
+    def run(self):
+        """Main loop."""
+        cv2.namedWindow('VR Keyboard')
+
+        calibration_point = [None]
+
+        def mouse_callback(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                calibration_point[0] = (x, y)
+                print(f"[CALIBRATION] Point selected: ({x}, {y})")
+
+        cv2.setMouseCallback('VR Keyboard', mouse_callback)
+
+        print("\n[STARTED] VR Keyboard running...\n")
+
+        # Warm up RealSense
+        print("[INFO] Warming up camera...")
+        for _ in range(30):
+            self.pipeline.wait_for_frames()
+
+        # Capture first frame for calibration
+        frames = self.pipeline.wait_for_frames()
+        aligned_frames = self.align.process(frames)
+        depth_frame = aligned_frames.get_depth_frame()
+        color_frame = aligned_frames.get_color_frame()
+        
+        if depth_frame and color_frame:
+            frame = np.asanyarray(color_frame.get_data())
+            depth_map = np.asanyarray(depth_frame.get_data()) * self.depth_scale
+            self.auto_calibrate_keyboard(depth_map, known_distance_cm=32.7)
+            self.reference_text = "sherbola is good"
+            self.use_key_bias = True
+        else:
+            print("[WARNING] Could not capture frame for auto-calibration")
+
+        try:
+            while True:
+                start_time = time.time()
+                
+                # Get aligned frames from RealSense
+                frames = self.pipeline.wait_for_frames()
+                aligned_frames = self.align.process(frames)
+                depth_frame = aligned_frames.get_depth_frame()
+                color_frame = aligned_frames.get_color_frame()
+
+                if not depth_frame or not color_frame:
+                    continue
+
+                # Convert to numpy arrays
+                frame = np.asanyarray(color_frame.get_data())
+                depth_map = np.asanyarray(depth_frame.get_data()) * self.depth_scale
+
+                # Hand tracking
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = self.hands.process(frame_rgb)
+
+                # BOOST: If no hands detected, try with slight preprocessing
+                if not results.multi_hand_landmarks:
+                    frame_boosted = cv2.convertScaleAbs(frame, alpha=1.2, beta=10)
+                    frame_rgb_boosted = cv2.cvtColor(frame_boosted, cv2.COLOR_BGR2RGB)
+                    results = self.hands.process(frame_rgb_boosted)
+
+                if self.last_pressed_key_frames > 0:
+                    self.last_pressed_key_frames -= 1
+
+                if results.multi_hand_landmarks:
+                    self.contact_detector.metrics.total_frames += 1
+                    
+                    # Sort hands left-to-right for consistent labeling
+                    hands_with_x = []
+                    for hand_idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
+                        wrist_x = hand_landmarks.landmark[0].x
+                        hands_with_x.append((wrist_x, hand_landmarks))
+                    
+                    hands_with_x.sort(key=lambda h: h[0])
+                    
+                    # Process sorted hands
+                    for hand_idx, (wrist_x, hand_landmarks) in enumerate(hands_with_x):
+                        # Draw hand skeleton
+                        self.mp_draw.draw_landmarks(
+                            frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS,
+                            landmark_drawing_spec=mp.solutions.drawing_utils.DrawingSpec(
+                                color=(0, 255, 0), thickness=3, circle_radius=4),
+                            connection_drawing_spec=mp.solutions.drawing_utils.DrawingSpec(
+                                color=(255, 255, 255), thickness=2)
+                        )
+
+                        # Process fingertips
+                        for fingertip_id in self.fingertip_landmarks:
+                            x, y, depth_corrected, _ = self._get_fingertip_depth(
+                                depth_map, hand_landmarks, fingertip_id, frame.shape[:2])
+
+                            finger_id = f"h{hand_idx}_f{fingertip_id}"
+
+                            # Check for key press
+                            pressed_key, confidence, debug_info = self._check_key_press(
+                                finger_id, frame, x, y, depth_corrected, start_time)
+                            
+                            # Log data
+                            if hasattr(self, '_log_data') and 'depth_cm' in debug_info and 'velocity_y' in debug_info:
+                                self._log_data.append({
+                                    'depth_mm': debug_info['depth_cm'] * 10,
+                                    'velocity': abs(debug_info['velocity_y']),
+                                    'label': 1 if pressed_key else 0
+                                })
+
+                            # Draw velocity indicator
+                            if 'velocity_y' in debug_info:
+                                vy = debug_info['velocity_y']
+                                tap_state = debug_info.get('tap_state', 'idle')
+
+                                if tap_state == 'approaching':
+                                    vel_color = (0, 165, 255)
+                                elif tap_state == 'contact':
+                                    vel_color = (0, 255, 0)
+                                elif tap_state == 'retracting':
+                                    vel_color = (255, 100, 100)
+                                else:
+                                    vel_color = (128, 128, 128)
+
+                                if abs(vy) > 5:
+                                    arrow_len = int(min(abs(vy) / 3, 30))
+                                    if vy > 0:
+                                        cv2.arrowedLine(frame, (x, y), (x, y + arrow_len), vel_color, 2, tipLength=0.3)
+                                    else:
+                                        cv2.arrowedLine(frame, (x, y), (x, y - arrow_len), vel_color, 2, tipLength=0.3)
+
+                            # Draw fingertip
+                            if self.last_tip_powers:
+                                fp = self.last_tip_powers.get(finger_id, 0.0)
+                                r_col = int(255 * fp)
+                                g_col = int(255 * (1-fp))
+                                ring_color = (50, g_col, r_col)
+                            else:
+                                ring_color = (150, 150, 150)
+                            
+                            if pressed_key:
+                                cv2.circle(frame, (x, y), 20, (0, 255, 0), -1)
+                                cv2.circle(frame, (x, y), 26, (255, 255, 255), 3)
+                                cv2.circle(frame, (x, y), 30, ring_color, 2)
+                            else:
+                                cv2.circle(frame, (x, y), 10, (100, 100, 255), -1)
+                                cv2.circle(frame, (x, y), 16, ring_color, 3)
+                                tap_state = debug_info.get('tap_state', 'idle')
+                                if tap_state == 'approaching':
+                                    cv2.circle(frame, (x, y), 22, (0, 165, 255), 2)
+
+                            # Draw confidence
+                            if confidence > 0.2:
+                                cv2.putText(frame, f"{confidence:.2f}", (x + 20, y - 10),
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+                            # Handle keypress
+                            if self.is_calibrated and pressed_key:
+                                if pressed_key != self.last_keys_pressed.get(finger_id):
+                                    self._handle_key_press(pressed_key)
+                                    self.last_keys_pressed[finger_id] = pressed_key
+                                    self.last_pressed_key_visual = pressed_key
+                                    self.last_pressed_key_frames = 10
+                            elif not pressed_key:
+                                self.last_keys_pressed[finger_id] = None
+
+                # Draw hand detection status
+                if results.multi_hand_landmarks:
+                    num_hands = len(results.multi_hand_landmarks)
+                else:
+                    num_hands = 0
+                hand_color = (0, 255, 0) if num_hands == 2 else (0, 165, 255) if num_hands == 1 else (0, 0, 255)
+                cv2.putText(frame, f"Hands: {num_hands}/2", (frame.shape[1] - 120, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, hand_color, 2)
+                
+                # Draw UI
+                self._draw_keyboard(frame)
+                self._draw_ui(frame)
+                self.riesz_viz.draw_to_window()
+                cv2.imshow('VR Keyboard', frame)
+
+                # FPS calculation
+                elapsed = time.time() - start_time
+                self.frame_times.append(elapsed)
+                if len(self.frame_times) > 30:
+                    self.frame_times.pop(0)
+                self.fps = 1.0 / np.mean(self.frame_times) if self.frame_times else 0
+
+                # Controls
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q') or key == 27:
+                    break
+                elif key == ord('c'):
+                    if calibration_point[0] and depth_map is not None:
+                        self.calibrate_keyboard_surface(depth_map, calibration_point[0])
+                        calibration_point[0] = None
+                    else:
+                        print("[WARNING] Click on keyboard surface first!")
+                elif key == ord('5'):
+                    if depth_map is not None:
+                        self.auto_calibrate_keyboard(depth_map)
+                        self.reference_text = "sherbola is good"
+                        self.use_key_bias = True
+                elif key == ord('d'):
+                    self.debug_mode = not self.debug_mode
+                    print(f"[DEBUG] {'ON' if self.debug_mode else 'OFF'}")
+                elif key == ord('m'):
+                    self.print_metrics()
+
+        finally:
+            print("\n[SHUTDOWN]")
+            self.print_metrics()
+            self.pipeline.stop()
+            cv2.destroyAllWindows()
+
+
+def main():
+    """Main entry point."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description='VR Keyboard - CVPR 2026 (V1)')
+    parser.add_argument('--annotation', default='./src/assets/keyboard_annotations.json', help='Keyboard annotation file')
+    parser.add_argument('--camera', type=int, default=1, help='Camera ID')
+    parser.add_argument('--all-fingers', action='store_true', help='Track all fingers (default: index only)')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('--no-keyboard', action='store_true', help='Disable real keyboard simulation')
+
+    args = parser.parse_args()
+
+    try:
+        keyboard = VRKeyboardCVPR2026(
+            annotation_file=args.annotation,
+            camera_id=args.camera,
+            track_all_fingers=args.all_fingers,
+            debug_mode=args.debug,
+            use_real_keyboard=not args.no_keyboard
+        )
+        keyboard.run()
+    except KeyboardInterrupt:
+        print("\n[INTERRUPTED] User stopped the program")
+    except Exception as e:
+        print(f"\n[ERROR] {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == '__main__':
+    main()

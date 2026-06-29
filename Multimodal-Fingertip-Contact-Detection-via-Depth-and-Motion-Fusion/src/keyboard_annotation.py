@@ -2,7 +2,7 @@ import numpy as np
 import cv2
 import json
 import os
-from camera_manager import CameraManager
+from camera_manager_for_depth_real_sense import CameraManager
 
 # --- Configuration ---
 camera_manager = CameraManager()
@@ -199,7 +199,7 @@ try:
         print("Failed to start camera stream. Exiting.")
         exit()
 
-    print(f"Webcam started at {CAMERA_WIDTH}x{CAMERA_HEIGHT}@{CAMERA_FPS}fps.")
+    print(f"RealSense D405 started at {CAMERA_WIDTH}x{CAMERA_HEIGHT}@{CAMERA_FPS}fps.")
     print(f"Instructions:")
     print(f"  - Press 'c' to CAPTURE a frame for annotation.")
     print(f"  - While a frame is captured, click {POINTS_PER_KEY} points to define a keycap.")
