@@ -41,3 +41,8 @@ runs/
 # Temporary
 *.tmp
 *.bak
+
+data_recording/data/
+data_recording/dataset/
+data_recording/__pycache__/
+*.npy

@@ -21,6 +21,18 @@ Usage:
 
   # Process everything
   python generate_contact_labels.py --data-root data
+
+PATCH (find_calibration only): fixed a bug where a session with a
+surface_calibration key present in metadata.json but set to null (which
+data_recording/session_manager.py always writes, even when nothing was
+calibrated) was treated as "found" and returned None immediately,
+skipping the fallback check for a standalone calibration file on disk
+entirely. Also extended that fallback to understand the NEWER
+multi-camera pipeline's metadata schema (top-level "surface" +
+per-camera "angle" in a "cameras" list, and calibration filenames
+prefixed with the camera name) alongside the original schema this
+function already supported, so sessions from either recorder can be
+found. No other function in this file was touched.
 """
 
 import argparse
@@ -206,11 +218,21 @@ def find_calibration(session_dir, calibrations_dir):
         with open(meta_file) as f:
             meta = json.load(f)
 
-        # Check if calibration is embedded in metadata
-        if "surface_calibration" in meta:
+        # Check if calibration is embedded in metadata.
+        # PATCH: meta.get(...) checks the VALUE, not just key presence.
+        # session_manager.py (the newer multi-camera pipeline) always
+        # writes this key, even when nothing was calibrated (value is
+        # null) -- the old "surface_calibration" in meta check matched
+        # that null immediately and returned None without ever trying
+        # the fallbacks below, silently treating "key exists but empty"
+        # the same as "definitely no calibration file exists either."
+        if meta.get("surface_calibration"):
             return meta["surface_calibration"]
 
-        # Try to find calibration file by angle + surface
+        # Fallback 1: older custom_data_recording/record.py schema --
+        # meta["session"]["angle_degrees"] / ["surface"], calibration
+        # file named without a camera name prefix (that pipeline only
+        # ever had one camera).
         session_info = meta.get("session", {})
         angle = session_info.get("angle_degrees")
         surface = session_info.get("surface")
@@ -220,6 +242,25 @@ def find_calibration(session_dir, calibrations_dir):
             if calib_file.exists():
                 with open(calib_file) as f:
                     return json.load(f)
+
+        # PATCH -- Fallback 2: newer data_recording/session_manager.py
+        # schema -- top-level meta["surface"], per-camera "angle" inside
+        # meta["cameras"], calibration file prefixed with that camera's
+        # name (data_recording/recorder.py's multi-camera rig can have
+        # more than one camera, so the filename disambiguates which).
+        surface = surface or meta.get("surface")
+        if surface:
+            for cam in meta.get("cameras", []) or []:
+                if cam.get("type") != "depth":
+                    continue
+                cam_angle = cam.get("angle")
+                cam_name = cam.get("name")
+                if cam_angle is None or not cam_name:
+                    continue
+                calib_file = calibrations_dir / f"calib_{cam_name}_angle{cam_angle}_{surface}.json"
+                if calib_file.exists():
+                    with open(calib_file) as f:
+                        return json.load(f)
 
     return None
 
