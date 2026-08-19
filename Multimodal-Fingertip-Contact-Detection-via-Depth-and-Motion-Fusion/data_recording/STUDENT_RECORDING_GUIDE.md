@@ -130,3 +130,27 @@ depth values look reasonable, without needing to watch the recording back.
 - Confirm each session folder has a `labels/` subfolder (means labeling succeeded).
 - Send/share your session folders (or their location) to your coordinator so they can
   be combined into the full dataset.
+
+
+## 8. Practical steps
+
+
+  python main.py
+
+python inspect_fingertip_depths.py data\P01\P01_white_desk_typing_<timestamp> --csv-out depth_report.csv
+
+python inspect_phone_depth.py data\P01\P01_white_desk_typing_<timestamp> --camera-name cam1 --csv-out cam1_depth_report.csv
+python inspect_phone_depth.py data\P01\P01_white_desk_typing_<timestamp> --camera-name cam2 --csv-out cam2_depth_report.csv
+
+cd ..\custom_data_recording
+python generate_contact_labels.py --data-root ..\data_recording\data
+
+cd ..\depth_finetuning
+$env:PYTHONPATH = "D:\DL\Research\Depth-Anything-V2\metric_depth"
+python estimate_phone_depth.py --data-root ..\data_recording\data --camera-name cam1 --checkpoint ..\checkpoints\depth_anything_v2_vits_d405_finetuned.pth
+python estimate_phone_depth.py --data-root ..\data_recording\data --camera-name cam2 --checkpoint ..\checkpoints\depth_anything_v2_vits_d405_finetuned.pth
+
+cd ..\data_recording
+python build_dataset_manifest.py --data-root data --out manifest.csv
+
+python export_npy_dataset.py --manifest manifest.csv --out-dir dataset\npy_v1 --train-ratio 0.8 --val-ratio 0.1
